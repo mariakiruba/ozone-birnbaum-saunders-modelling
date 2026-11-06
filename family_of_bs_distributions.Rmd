@@ -1,0 +1,304 @@
+---
+title: "Family of Birnbaum–Saunders Distributions: Modelling Ozone Levels"
+author: "Maria Kiruba R"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. Aim
+
+Fit five Birnbaum–Saunders (BS)-family models to daily ozone readings by maximum
+likelihood, compare them with AIC, BIC and the Kolmogorov–Smirnov (KS) test, and plot
+the fitted curves over the data.
+
+| Model | Description |
+|---|---|
+| BS | Standard two-parameter Birnbaum–Saunders |
+| Log-GBS | Generalised BS with a logistic parent distribution |
+| t-BS | Student's-t BS (extra parameter: degrees of freedom) |
+| Delta-BS | Power-exponent generalisation of BS (delta = 1 gives the ordinary BS) |
+| KM-BS | BS passed through the Kavya–Manoharan transformation |
+
+**Note on the density:** for the BS-type models, the density of x is
+f(x) = g(z) * (x + beta) / (2 * alpha * x * sqrt(x * beta)), where
+z = (sqrt(x/beta) - sqrt(beta/x)) / alpha and g is the parent density
+(normal, logistic or Student's-t). This is the form used below.
+
+## 2. Load and clean the data
+
+Keep the data file in the same folder as this .Rmd file. To run another city,
+change `data_file` and `city_name` and knit again.
+
+```{r load-data}
+data_file <- "D:/winter semester/Statistical Inference lab/O3 dataset.xlsx"  # file name only (no D:/ path)
+city_name <- "Ahmedabad"         # used in plot titles and output file names
+
+if (grepl("\\.csv$", data_file, ignore.case = TRUE)) {
+  raw <- read.csv(data_file)
+} else {
+  library(readxl)
+  raw <- read_excel(data_file)
+}
+
+x_all <- suppressWarnings(as.numeric(raw[[1]]))
+x <- x_all[!is.na(x_all) & x_all > 0]   # BS-type models need x > 0
+n <- length(x)
+
+cat("Observations read:", length(x_all), "\n")
+cat("Kept (non-missing and positive):", n, "\n")
+summary(x)
+```
+
+## 3. Model functions
+
+```{r model-functions}
+# ---------- common pieces ----------
+z_bs <- function(x, alpha, beta) (1 / alpha) * (sqrt(x / beta) - sqrt(beta / x))
+
+# log of the Jacobian term (x + beta) / (2 * alpha * x * sqrt(x * beta))
+log_jac_bs <- function(x, alpha, beta) {
+  log(x + beta) - log(2 * alpha) - 1.5 * log(x) - 0.5 * log(beta)
+}
+
+BAD <- 1e10   # returned when parameters are invalid
+
+# ---------- 1. Birnbaum-Saunders (BS) ----------
+cdf_bs <- function(x, alpha, beta) pnorm(z_bs(x, alpha, beta))
+pdf_bs <- function(x, alpha, beta) {
+  dnorm(z_bs(x, alpha, beta)) * exp(log_jac_bs(x, alpha, beta))
+}
+loglik_bs <- function(par, x) {
+  alpha <- par[1]; beta <- par[2]
+  if (alpha <= 0 || beta <= 0) return(BAD)
+  logpdf <- dnorm(z_bs(x, alpha, beta), log = TRUE) + log_jac_bs(x, alpha, beta)
+  if (any(!is.finite(logpdf))) return(BAD)
+  -sum(logpdf)
+}
+
+# ---------- 2. Logistic-GBS (Log-GBS) ----------
+cdf_lgbs <- function(x, alpha, beta) plogis(z_bs(x, alpha, beta))
+pdf_lgbs <- function(x, alpha, beta) {
+  dlogis(z_bs(x, alpha, beta)) * exp(log_jac_bs(x, alpha, beta))
+}
+loglik_lgbs <- function(par, x) {
+  alpha <- par[1]; beta <- par[2]
+  if (alpha <= 0 || beta <= 0) return(BAD)
+  logpdf <- dlogis(z_bs(x, alpha, beta), log = TRUE) + log_jac_bs(x, alpha, beta)
+  if (any(!is.finite(logpdf))) return(BAD)
+  -sum(logpdf)
+}
+
+# ---------- 3. Student-t BS (t-BS) ----------
+cdf_tbs <- function(x, alpha, beta, nu) pt(z_bs(x, alpha, beta), df = nu)
+pdf_tbs <- function(x, alpha, beta, nu) {
+  dt(z_bs(x, alpha, beta), df = nu) * exp(log_jac_bs(x, alpha, beta))
+}
+loglik_tbs <- function(par, x) {
+  alpha <- par[1]; beta <- par[2]; nu <- par[3]
+  if (alpha <= 0 || beta <= 0 || nu <= 1) return(BAD)
+  logpdf <- dt(z_bs(x, alpha, beta), df = nu, log = TRUE) + log_jac_bs(x, alpha, beta)
+  if (any(!is.finite(logpdf))) return(BAD)
+  -sum(logpdf)
+}
+
+# ---------- 4. Delta-BS (power-exponent generalisation) ----------
+z_delta <- function(x, alpha, beta, delta) {
+  (1 / alpha) * ((x / beta)^(delta / 2) - (beta / x)^(delta / 2))
+}
+jac_delta <- function(x, alpha, beta, delta) {
+  (delta / (2 * alpha)) *
+    (beta^(-delta / 2) * x^(delta / 2 - 1) + beta^(delta / 2) * x^(-(delta / 2 + 1)))
+}
+cdf_delta_bs <- function(x, alpha, beta, delta) pnorm(z_delta(x, alpha, beta, delta))
+pdf_delta_bs <- function(x, alpha, beta, delta) {
+  dnorm(z_delta(x, alpha, beta, delta)) * jac_delta(x, alpha, beta, delta)
+}
+loglik_delta <- function(par, x) {
+  alpha <- par[1]; beta <- par[2]; delta <- par[3]
+  if (alpha <= 0 || beta <= 0 || delta <= 0) return(BAD)
+  logpdf <- dnorm(z_delta(x, alpha, beta, delta), log = TRUE) +
+    log(jac_delta(x, alpha, beta, delta))
+  if (any(!is.finite(logpdf))) return(BAD)
+  -sum(logpdf)
+}
+
+# ---------- 5. KM-BS (Kavya-Manoharan transformation of BS) ----------
+km_const <- exp(1) / (exp(1) - 1)
+cdf_kmbs <- function(x, alpha, beta) km_const * (1 - exp(-cdf_bs(x, alpha, beta)))
+pdf_kmbs <- function(x, alpha, beta) {
+  km_const * exp(-cdf_bs(x, alpha, beta)) * pdf_bs(x, alpha, beta)
+}
+loglik_kmbs <- function(par, x) {
+  alpha <- par[1]; beta <- par[2]
+  if (alpha <= 0 || beta <= 0) return(BAD)
+  G <- cdf_bs(x, alpha, beta)
+  logpdf <- log(km_const) - G +
+    dnorm(z_bs(x, alpha, beta), log = TRUE) + log_jac_bs(x, alpha, beta)
+  if (any(!is.finite(logpdf))) return(BAD)
+  -sum(logpdf)
+}
+```
+
+## 4. Starting values
+
+Modified-moment estimates for the BS model are used as starting points
+(s = arithmetic mean, r = harmonic mean).
+
+```{r start-values}
+s <- mean(x)
+r <- 1 / mean(1 / x)
+alpha0 <- sqrt(2 * (sqrt(s / r) - 1))
+beta0  <- sqrt(s * r)
+if (!is.finite(alpha0) || alpha0 < 0.05) alpha0 <- 0.5
+
+c(alpha0 = alpha0, beta0 = beta0)
+```
+
+## 5. Maximum likelihood fitting
+
+Each model is fitted from several starting points and the best result is kept.
+
+```{r fit}
+fit_model <- function(fn, starts, lower, x) {
+  fits <- lapply(starts, function(s0) {
+    tryCatch(optim(s0, fn, x = x, method = "L-BFGS-B", lower = lower),
+             error = function(e) NULL)
+  })
+  fits <- Filter(Negate(is.null), fits)
+  fits <- Filter(function(f) is.finite(f$value) && f$value < BAD / 10, fits)
+  if (length(fits) == 0) stop("No valid fit found for this model.")
+  fits[[which.min(sapply(fits, function(f) f$value))]]
+}
+
+eps <- 1e-8
+starts2   <- list(c(alpha0, beta0), c(1, median(x)), c(0.5, median(x)))
+starts3_t <- lapply(starts2, function(s0) c(s0, 5))
+starts3_d <- lapply(starts2, function(s0) c(s0, 1))
+
+fit_bs    <- fit_model(loglik_bs,    starts2,   c(eps, eps),       x)
+fit_lgbs  <- fit_model(loglik_lgbs,  starts2,   c(eps, eps),       x)
+fit_tbs   <- fit_model(loglik_tbs,   starts3_t, c(eps, eps, 1.01), x)
+fit_delta <- fit_model(loglik_delta, starts3_d, c(eps, eps, eps),  x)
+fit_kmbs  <- fit_model(loglik_kmbs,  starts2,   c(eps, eps),       x)
+
+# 0 = the optimiser reports convergence
+c(BS = fit_bs$convergence, LogGBS = fit_lgbs$convergence, tBS = fit_tbs$convergence,
+  DeltaBS = fit_delta$convergence, KMBS = fit_kmbs$convergence)
+```
+
+## 6. Model selection: AIC, BIC and KS test
+
+```{r criteria}
+AIC_manual <- function(nll, k) 2 * k + 2 * nll
+BIC_manual <- function(nll, k, n) log(n) * k + 2 * nll
+
+fits <- list(BS = fit_bs, `t-BS` = fit_tbs, `Delta-BS` = fit_delta,
+             `Log-GBS` = fit_lgbs, `KM-BS` = fit_kmbs)
+
+aic <- sapply(fits, function(f) AIC_manual(f$value, length(f$par)))
+bic <- sapply(fits, function(f) BIC_manual(f$value, length(f$par), n))
+
+# KS test (a tiny jitter breaks ties in rounded measurements)
+set.seed(101)
+x_j <- jitter(x, amount = 1e-6)
+ks <- list(
+  BS         = ks.test(x_j, function(y) cdf_bs(y, fit_bs$par[1], fit_bs$par[2])),
+  `t-BS`     = ks.test(x_j, function(y) cdf_tbs(y, fit_tbs$par[1], fit_tbs$par[2], fit_tbs$par[3])),
+  `Delta-BS` = ks.test(x_j, function(y) cdf_delta_bs(y, fit_delta$par[1], fit_delta$par[2], fit_delta$par[3])),
+  `Log-GBS`  = ks.test(x_j, function(y) cdf_lgbs(y, fit_lgbs$par[1], fit_lgbs$par[2])),
+  `KM-BS`    = ks.test(x_j, function(y) cdf_kmbs(y, fit_kmbs$par[1], fit_kmbs$par[2]))
+)
+```
+
+## 7. Comparison table
+
+```{r results-table}
+results <- data.frame(
+  Model       = names(fits),
+  Alpha       = sapply(fits, function(f) f$par[1]),
+  Beta        = sapply(fits, function(f) f$par[2]),
+  Extra_Param = sapply(fits, function(f) if (length(f$par) > 2) f$par[3] else NA),
+  AIC         = aic,
+  BIC         = bic,
+  KS_Statistic = sapply(ks, function(k) unname(k$statistic)),
+  KS_p_value   = sapply(ks, function(k) k$p.value),
+  Converged    = sapply(fits, function(f) f$convergence == 0),
+  row.names = NULL
+)
+num_cols <- c("Alpha", "Beta", "Extra_Param", "AIC", "BIC", "KS_Statistic", "KS_p_value")
+results[, num_cols] <- round(results[, num_cols], 6)
+
+knitr::kable(results,
+  caption = paste("Comparison of Birnbaum–Saunders models:", city_name, "ozone"))
+
+cat("Lowest AIC:", results$Model[which.min(results$AIC)], "\n")
+cat("Lowest BIC:", results$Model[which.min(results$BIC)], "\n")
+
+dir.create("results", showWarnings = FALSE)
+write.csv(results, file.path("results", paste0("comparison_", tolower(city_name), ".csv")),
+          row.names = FALSE)
+```
+
+## 8. Plots
+
+```{r plots, fig.width=9, fig.height=6}
+cols <- c(BS = "blue", `Log-GBS` = "red", `t-BS` = "darkgreen",
+          `Delta-BS` = "purple", `KM-BS` = "orange")
+ltys <- c(BS = 1, `Log-GBS` = 2, `t-BS` = 3, `Delta-BS` = 4, `KM-BS` = 5)
+xs <- seq(min(x), max(x), length.out = 1000)
+
+plot_pdf_fits <- function() {
+  h <- hist(x, breaks = 40, plot = FALSE)
+  plot(h, freq = FALSE, ylim = c(0, max(h$density) * 1.6),
+       col = "grey90", border = "white",
+       main = paste("Ozone:", city_name, "- histogram with fitted distributions"),
+       xlab = "Ozone concentration", ylab = "Density")
+  lines(xs, pdf_bs(xs, fit_bs$par[1], fit_bs$par[2]), col = cols["BS"], lwd = 2, lty = ltys["BS"])
+  lines(xs, pdf_lgbs(xs, fit_lgbs$par[1], fit_lgbs$par[2]), col = cols["Log-GBS"], lwd = 2, lty = ltys["Log-GBS"])
+  lines(xs, pdf_tbs(xs, fit_tbs$par[1], fit_tbs$par[2], fit_tbs$par[3]), col = cols["t-BS"], lwd = 2, lty = ltys["t-BS"])
+  lines(xs, pdf_delta_bs(xs, fit_delta$par[1], fit_delta$par[2], fit_delta$par[3]), col = cols["Delta-BS"], lwd = 2, lty = ltys["Delta-BS"])
+  lines(xs, pdf_kmbs(xs, fit_kmbs$par[1], fit_kmbs$par[2]), col = cols["KM-BS"], lwd = 2, lty = ltys["KM-BS"])
+  legend("topright", legend = names(cols), col = cols, lty = ltys, lwd = 2, bty = "n")
+}
+
+plot_cdf_fits <- function() {
+  plot(ecdf(x), do.points = FALSE, verticals = TRUE, col = "grey40", lwd = 2,
+       main = paste("Ozone:", city_name, "- empirical vs fitted CDF"),
+       xlab = "Ozone concentration", ylab = "Cumulative probability")
+  lines(xs, cdf_bs(xs, fit_bs$par[1], fit_bs$par[2]), col = cols["BS"], lwd = 2, lty = ltys["BS"])
+  lines(xs, cdf_lgbs(xs, fit_lgbs$par[1], fit_lgbs$par[2]), col = cols["Log-GBS"], lwd = 2, lty = ltys["Log-GBS"])
+  lines(xs, cdf_tbs(xs, fit_tbs$par[1], fit_tbs$par[2], fit_tbs$par[3]), col = cols["t-BS"], lwd = 2, lty = ltys["t-BS"])
+  lines(xs, cdf_delta_bs(xs, fit_delta$par[1], fit_delta$par[2], fit_delta$par[3]), col = cols["Delta-BS"], lwd = 2, lty = ltys["Delta-BS"])
+  lines(xs, cdf_kmbs(xs, fit_kmbs$par[1], fit_kmbs$par[2]), col = cols["KM-BS"], lwd = 2, lty = ltys["KM-BS"])
+  legend("bottomright", legend = c("Empirical", names(cols)),
+         col = c("grey40", cols), lty = c(1, ltys), lwd = 2, bty = "n")
+}
+
+plot_pdf_fits()
+plot_cdf_fits()
+
+# Save the plots as PNG files for GitHub
+dir.create("figures", showWarnings = FALSE)
+png(file.path("figures", paste0("ozone_", tolower(city_name), "_pdf_fit.png")),
+    width = 1000, height = 700, res = 120)
+plot_pdf_fits()
+dev.off()
+png(file.path("figures", paste0("ozone_", tolower(city_name), "_cdf_fit.png")),
+    width = 1000, height = 700, res = 120)
+plot_cdf_fits()
+dev.off()
+```
+
+## 9. How to read the results
+
+- Lower AIC and BIC mean a better balance of fit and simplicity.
+- A smaller KS statistic and a larger p-value mean the fitted CDF is closer to the data.
+  With very large samples the KS test rejects almost every model, so compare the
+  statistics as well as the p-values.
+- Check the `Converged` column and the plots before drawing any conclusion. A fitted
+  curve that sits far from the histogram means the fit should not be trusted.
